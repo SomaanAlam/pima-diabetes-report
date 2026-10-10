@@ -1,0 +1,284 @@
+---
+title: "What Is Linked to Diabetes? A Plain-English Look at the Pima Indians Diabetes Data"
+author: "Somaan"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    theme: cosmo
+    self_contained: true
+  github_document:
+    toc: true
+    toc_depth: 2
+    html_preview: false
+---
+
+```{r setup, include=FALSE}
+# Reader-facing report: code is hidden here, but every number in the text is
+# computed from the data below. Cleaning code lives in ../R/clean_data.R.
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.width = 7.5, fig.height = 4.2, dpi = 150)
+library(dplyr)
+library(ggplot2)
+library(knitr)
+source("../R/clean_data.R")
+
+theme_set(theme_minimal(base_size = 12) +
+            theme(plot.title.position = "plot",
+                  panel.grid.minor = element_blank()))
+col_no   <- "#0072B2"   # colour-blind-safe pair
+col_yes  <- "#D55E00"
+```
+
+```{r analysis}
+# ---- Load and clean --------------------------------------------------------
+raw <- load_raw_pima("../data/pima-indians-diabetes.raw.csv")
+d   <- clean_pima(raw)
+
+n_total  <- nrow(d)
+n_diab   <- sum(d$outcome == 1)
+pct_diab <- 100 * mean(d$outcome == 1)
+
+# ---- Regression data -------------------------------------------------------
+# Skin thickness and insulin are left out: ~30% and ~49% of values are missing.
+# For the remaining predictors, women with any missing value are dropped.
+# Predictors are rescaled so each odds ratio is for a meaningful step.
+m <- d |>
+  select(outcome, glucose, bmi, age, pregnancies, blood_pressure, pedigree) |>
+  na.omit() |>
+  mutate(glucose10 = glucose / 10,
+         bmi5      = bmi / 5,
+         age10     = age / 10,
+         bp10      = blood_pressure / 10,
+         ped05     = pedigree / 0.5)
+n_model <- nrow(m)
+
+fit <- glm(outcome ~ glucose10 + bmi5 + age10 + pregnancies + bp10 + ped05,
+           data = m, family = binomial)
+
+term_labels <- c(glucose10   = "Blood glucose (per +10 mg/dL)",
+                 bmi5        = "BMI (per +5 units)",
+                 age10       = "Age (per +10 years)",
+                 pregnancies = "Pregnancies (per +1)",
+                 bp10        = "Diastolic blood pressure (per +10 mm Hg)",
+                 ped05       = "Family-history score (per +0.5)")
+
+est <- cbind(summary(fit)$coefficients, confint.default(fit))  # Wald 95% CIs
+or_tab <- data.frame(term = rownames(est),
+                     OR   = exp(est[, "Estimate"]),
+                     lo   = exp(est[, "2.5 %"]),
+                     hi   = exp(est[, "97.5 %"]),
+                     p    = est[, "Pr(>|z|)"],
+                     row.names = NULL) |>
+  filter(term != "(Intercept)")
+or_tab$label <- factor(term_labels[or_tab$term], levels = rev(term_labels[or_tab$term]))
+or_of <- function(t) or_tab[or_tab$term == t, ]
+
+fmt_p  <- function(p) ifelse(p < 0.001, "<0.001", sprintf("%.3f", p))
+fmt_or <- function(t) sprintf("%.2f", or_of(t)$OR)
+
+# ---- Honest performance check: 5-fold cross-validation ---------------------
+auc <- function(y, p) {            # chance a random case outranks a random non-case
+  r <- rank(p); n1 <- sum(y == 1); n0 <- sum(y == 0)
+  (sum(r[y == 1]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+}
+set.seed(2026)
+fold <- sample(rep(1:5, length.out = n_model))
+cv <- sapply(1:5, function(k) {
+  tr <- m[fold != k, ]; te <- m[fold == k, ]
+  p  <- predict(update(fit, data = tr), newdata = te, type = "response")
+  c(auc = auc(te$outcome, p), acc = mean((p > 0.5) == te$outcome))
+})
+cv_auc   <- mean(cv["auc", ])
+cv_acc   <- mean(cv["acc", ])
+base_acc <- mean(m$outcome == 0)   # accuracy of always guessing "no diabetes"
+
+# ---- Worked example: predicted probabilities for a "typical" woman ---------
+typical <- m |> summarise(across(c(glucose10, bmi5, age10, pregnancies, bp10, ped05), median))
+scen <- bind_rows(typical,
+                  typical |> mutate(glucose10 = glucose10 + 2),
+                  typical |> mutate(bmi5 = bmi5 + 1))
+pr <- 100 * predict(fit, newdata = scen, type = "response")
+```
+
+## The short version
+
+I analysed health records for `r n_total` women from the Pima Indian community in Arizona, `r n_diab` of whom (`r sprintf("%.0f", pct_diab)`%) had diabetes. The aim was to see which measurements go along with having diabetes, and how strongly.
+
+- **Blood glucose and body weight are the clearest signals.** After accounting for the other measurements, each extra 10 mg/dL of glucose goes with roughly `r sprintf("%.0f", 100 * (or_of("glucose10")$OR - 1))`% higher odds of diabetes, and each extra 5 BMI points with roughly `r sprintf("%.0f", 100 * (or_of("bmi5")$OR - 1))`% higher odds.
+- **Number of pregnancies and family history also matter.** Each additional pregnancy and a higher family-history score are both linked to higher odds.
+- **Age and blood pressure are not clearly linked** once everything else is taken into account.
+- **The model separates the two groups reasonably well but is not a diagnostic tool.** On women it had not seen, it scored an AUC of `r sprintf("%.2f", cv_auc)` (0.5 is a coin flip, 1.0 is perfect).
+
+All of this describes *associations in one specific group*. It does not show that changing any single factor would prevent diabetes.
+
+## The data
+
+The data come from a study by the US National Institute of Diabetes and Digestive and Kidney Diseases, and are widely available from the UCI Machine Learning Repository and Kaggle. Each row is one woman, all aged 21 or over, with eight measurements and a yes/no diabetes outcome:
+
+| Measurement | What it is |
+|:--|:--|
+| Pregnancies | Number of times pregnant |
+| Glucose | Blood sugar two hours after a standard sugar drink (mg/dL) |
+| Blood pressure | Diastolic blood pressure (mm Hg) |
+| Skin thickness | Triceps skin-fold thickness (mm), a rough measure of body fat |
+| Insulin | Insulin level two hours after the sugar drink (mu U/ml) |
+| BMI | Body mass index (kg/m²) |
+| Family-history score | A score summarising diabetes in the woman's relatives (higher = more family history) |
+| Age | Age in years |
+
+## Cleaning the data
+
+The raw file has no column names, so I added them from the dataset documentation. No rows were duplicated.
+
+The main problem is that **missing values are hidden as zeros**. A blood pressure or BMI of 0 is impossible, so these zeros mean "not recorded". Left in place, they would drag averages down and distort the regression. I converted them to missing values in the five measurements where zero cannot be real.
+
+```{r missing-table}
+miss <- data.frame(
+  Measurement = c("Insulin", "Skin thickness", "Blood pressure", "BMI", "Glucose"),
+  var         = c("insulin", "skin_thickness", "blood_pressure", "bmi", "glucose"))
+miss$`Zeros recoded as missing` <- sapply(miss$var, function(v) sum(is.na(d[[v]])))
+miss$`Share of women`           <- sprintf("%.1f%%", 100 * miss$`Zeros recoded as missing` / n_total)
+kable(miss[, c("Measurement", "Zeros recoded as missing", "Share of women")],
+      align = "lrr")
+```
+
+What I did about it:
+
+- **Insulin and skin thickness** are missing for too many women to rescue (nearly half and about 30%), so I left them out of the regression rather than guess their values.
+- For the other measurements I kept only the `r n_model` women (`r sprintf("%.0f", 100 * n_model / n_total)`% of the data) with complete records. The few missing values make this a reasonable trade-off, but it does assume that who is missing is not systematically linked to diabetes.
+
+## Who has diabetes?
+
+```{r desc-table}
+med_iqr <- function(x, digits = 0) {
+  q <- quantile(x, c(.25, .5, .75), na.rm = TRUE)
+  sprintf(paste0("%.", digits, "f (%.", digits, "f to %.", digits, "f)"), q[2], q[1], q[3])
+}
+vars <- list(`Age (years)` = c("age", 0),
+             `Pregnancies` = c("pregnancies", 0),
+             `BMI` = c("bmi", 1),
+             `Glucose (mg/dL)` = c("glucose", 0),
+             `Diastolic blood pressure (mm Hg)` = c("blood_pressure", 0))
+tab1 <- do.call(rbind, lapply(names(vars), function(lbl) {
+  v <- vars[[lbl]][1]; dg <- as.numeric(vars[[lbl]][2])
+  data.frame(Measurement = lbl,
+             `No diabetes` = med_iqr(d[[v]][d$diabetes == "No diabetes"], dg),
+             `Diabetes`    = med_iqr(d[[v]][d$diabetes == "Diabetes"], dg),
+             check.names = FALSE)
+}))
+names(tab1)[2:3] <- c(sprintf("No diabetes (n = %d)", sum(d$outcome == 0)),
+                      sprintf("Diabetes (n = %d)", n_diab))
+kable(tab1, align = "lrr",
+      caption = "Median, with the middle half of values in brackets (25th to 75th percentile). Missing values excluded.")
+```
+
+Women with diabetes had noticeably higher glucose and BMI, and were older and had been pregnant more times. Splitting the women into groups makes the pattern easy to see:
+
+```{r prevalence-plot, fig.height = 4}
+prev <- bind_rows(
+  d |> filter(!is.na(bmi_group)) |>
+    group_by(group = bmi_group) |>
+    summarise(n = n(), pct = 100 * mean(outcome), .groups = "drop") |>
+    mutate(panel = "By body mass index (BMI)"),
+  d |> group_by(group = age_group) |>
+    summarise(n = n(), pct = 100 * mean(outcome), .groups = "drop") |>
+    mutate(panel = "By age (years)"))
+prev$panel <- factor(prev$panel, levels = c("By body mass index (BMI)", "By age (years)"))
+
+ggplot(prev, aes(group, pct)) +
+  geom_col(fill = col_yes, width = 0.65) +
+  geom_text(aes(label = sprintf("%.0f%%", pct)), vjust = -0.4, size = 3.8) +
+  facet_wrap(~panel, scales = "free_x") +
+  scale_x_discrete(labels = function(x) gsub(" \\(", "\n(", x)) +
+  scale_y_continuous(limits = c(0, 65), expand = c(0, 0)) +
+  labs(title = "Share of women with diabetes",
+       x = NULL, y = "% with diabetes") +
+  theme(axis.text.x = element_text(size = 9))
+```
+
+Only about `r sprintf("%.0f", prev$pct[prev$group == "Healthy weight (<25)"])`% of women in the healthy-weight group had diabetes, against roughly `r sprintf("%.0f", prev$pct[prev$group == "Obese (30+)"])`% of those with obesity. Prevalence also rises with age, peaking at `r sprintf("%.0f", prev$pct[prev$group == "40-49"])`% among women in their 40s, and is a little lower for women aged 50 and over. Glucose separates the two groups most clearly of all:
+
+```{r glucose-plot}
+d |> filter(!is.na(glucose)) |>
+  ggplot(aes(glucose, fill = diabetes, colour = diabetes)) +
+  geom_density(alpha = 0.35, linewidth = 0.8) +
+  scale_fill_manual(values = c(col_no, col_yes)) +
+  scale_colour_manual(values = c(col_no, col_yes)) +
+  labs(title = "Blood glucose by diabetes status",
+       x = "Glucose after sugar drink (mg/dL)", y = "Density",
+       fill = NULL, colour = NULL) +
+  theme(legend.position = "top", axis.text.y = element_blank())
+```
+
+One caution: glucose is part of how diabetes is diagnosed, so a strong link between the two is expected and is not a surprising discovery.
+
+## Which factors matter most? A regression
+
+Looking at one measurement at a time can mislead, because the measurements overlap. For example, older women have tended to be pregnant more often (correlation about `r sprintf("%.2f", cor(m$age, m$pregnancies))` in this data), so it is hard to tell whether age or pregnancies is doing the work.
+
+**Logistic regression** handles this. It estimates the link between each measurement and diabetes *while holding the others fixed*. Results are reported as **odds ratios**:
+
+- An odds ratio of **1** means no link.
+- Above 1 means higher odds of diabetes, and below 1 means lower odds.
+- An odds ratio of 1.42 means the odds are about 42% higher.
+
+Odds are not the same as risk. Because diabetes is common here (about one in three), odds ratios look bigger than the change in actual probability, which is why I also give probabilities below. I rescaled the measurements so that each odds ratio is for a sensible step, such as +10 mg/dL of glucose.
+
+```{r forest-plot, fig.height = 3.6}
+ggplot(or_tab, aes(OR, label)) +
+  geom_vline(xintercept = 1, linetype = "dashed", colour = "grey40") +
+  geom_linerange(aes(xmin = lo, xmax = hi), linewidth = 0.8, colour = "grey30") +
+  geom_point(size = 3, colour = col_yes) +
+  scale_x_log10(breaks = c(0.8, 1, 1.25, 1.5, 2)) +
+  labs(title = "Odds ratios for diabetes, all factors modelled together",
+       subtitle = "Dot = estimate; line = 95% confidence interval. Right of the dashed line = higher odds.",
+       x = "Odds ratio (log scale)", y = NULL) +
+  theme(plot.subtitle = element_text(size = 10, colour = "grey30"))
+```
+
+```{r or-table}
+out <- data.frame(
+  Factor = as.character(or_tab$label[match(or_tab$term, names(term_labels))]),
+  `Odds ratio` = sprintf("%.2f", or_tab$OR),
+  `95% confidence interval` = sprintf("%.2f to %.2f", or_tab$lo, or_tab$hi),
+  `p-value` = fmt_p(or_tab$p),
+  check.names = FALSE)
+kable(out, align = "lrrr",
+      caption = sprintf("Logistic regression on %d women with complete records.", n_model))
+```
+
+**What this says in plain terms**
+
+- **Glucose** has the strongest statistical evidence behind it: the chance of seeing a link this strong if there were truly none is vanishingly small. Each extra 10 mg/dL goes with odds about `r fmt_or("glucose10")` times higher.
+- **BMI** has a large and clear effect: each extra 5 points goes with odds about `r fmt_or("bmi5")` times higher.
+- **Pregnancies** and the **family-history score** are also clearly linked (odds ratios `r fmt_or("pregnancies")` per pregnancy and `r fmt_or("ped05")` per 0.5 on the score).
+- **Age** has an odds ratio of `r fmt_or("age10")` per decade, but its interval (`r sprintf("%.2f to %.2f", or_of("age10")$lo, or_of("age10")$hi)`) includes 1, so the data do not firmly separate it from no effect. This is partly because age and pregnancies move together.
+- **Blood pressure** shows no clear link (odds ratio `r fmt_or("bp10")`, interval `r sprintf("%.2f to %.2f", or_of("bp10")$lo, or_of("bp10")$hi)`).
+
+The steps are different sizes (10 mg/dL of glucose versus 5 BMI points versus one pregnancy), so the odds ratios should not be read as a ranking of which factor matters most.
+
+**A worked example.** Take a woman with the middle value on every measurement (glucose about `r sprintf("%.0f", median(m$glucose))` mg/dL, BMI about `r sprintf("%.0f", median(m$bmi))`, age about `r sprintf("%.0f", median(m$age))`). The model puts her chance of diabetes at about **`r sprintf("%.0f", pr[1])`%**. If her glucose were 20 mg/dL higher, that rises to about **`r sprintf("%.0f", pr[2])`%**. If her BMI were 5 points higher instead, it rises to about **`r sprintf("%.0f", pr[3])`%**.
+
+## How well does the model work?
+
+A model should be tested on data it has not seen, otherwise it can look better than it is. I split the women into five groups, trained on four, tested on the fifth, and repeated this for each group (5-fold cross-validation).
+
+- **AUC `r sprintf("%.2f", cv_auc)`.** Pick one woman with diabetes and one without at random: the model gives the higher score to the woman with diabetes about `r sprintf("%.0f", 100 * cv_auc)`% of the time.
+- **Accuracy `r sprintf("%.0f", 100 * cv_acc)`%.** Simply guessing "no diabetes" for everyone would be right `r sprintf("%.0f", 100 * base_acc)`% of the time, so the model adds real information, but it still gets about one woman in four wrong.
+
+That is solid for a simple model, but it is a long way from something a clinician would rely on.
+
+## Limitations
+
+- **It is one specific group.** All participants are adult women of Pima Indian heritage in Arizona, from a study that is decades old. The sizes of the links may not carry over to other populations.
+- **Association, not cause.** This is observational data. Higher BMI going with higher odds of diabetes does not prove that reducing BMI would lower them.
+- **Glucose is part of the diagnosis**, so its strong link overstates how useful it is as an independent "risk factor".
+- **Missing data.** Zeros hiding missing values were a real problem. I dropped two measurements and incomplete records, which could introduce bias if the missingness is related to health.
+- **Simple modelling choices.** I assumed each measurement has a straight-line effect on the log-odds and did not test interactions or fit more flexible models. The confidence intervals are the standard approximate (Wald) kind.
+- **Unclear outcome timing.** The dataset documentation is not fully clear about exactly when diabetes was assessed relative to the measurements, so I treat the outcome as a plain yes/no flag.
+
+## Reproducing this report
+
+All code and data are in the project repository (see the README). Built with `r R.version.string`, dplyr `r as.character(packageVersion("dplyr"))`, ggplot2 `r as.character(packageVersion("ggplot2"))`.
